@@ -13,7 +13,7 @@ stdenvNoCC.mkDerivation rec {
     owner = "gui-wf";
     repo = "mpv-gradual-pause";
     rev = "v${version}";
-    hash = ""; # Will be filled after first release
+    hash = "sha256-Kir27xNEnktOG16VzetFbRCesdklnd+NHcVtsd0iGzM=";
   };
 
   dontBuild = true;
