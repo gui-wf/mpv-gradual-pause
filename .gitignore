@@ -1,0 +1,25 @@
+# Nix build results
+result
+result-*
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Temporary files
+*.tmp
+*.bak
+
+# Test videos
+*.mp4
+*.mkv
+*.avi
+*.webm
+!test-*.mp4
