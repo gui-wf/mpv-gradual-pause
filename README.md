@@ -1,6 +1,16 @@
 # MPV Gradual Pause
 
-A sophisticated MPV script that adds smooth audio fade effects when pausing/unpausing video playback, eliminating jarring audio cuts for a more pleasant viewing experience.
+MPV script that adds smooth audio fade effects when pausing/unpausing
+
+Do the immediate audio cut on pausing media bugs you?
+Frustrate no more -> I fade the audio on your music and video experience.
+
+I'm an MPV Script that adds a fade-in and fade-out effect
+when pausing or unpausing music/video playback.
+
+Features logarithmic and linear volume curves, MPRIS "integration"
+support, and robust state management for seamless operation with external
+pause controls.
 
 ## Features
 
