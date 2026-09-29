@@ -95,9 +95,9 @@ We actively welcome pull requests for:
         --script-opts=gradual_pause-fade_out_duration=1.0 \
         video.mp4
 
-   # Test with linear fading
+   # Test with a linear ramp
    mpv --script=./scripts/gradual_pause.lua \
-        --script-opts=gradual_pause-logarithmic_fade=no \
+        --script-opts=gradual_pause-fade_curve=linear \
         video.mp4
    ```
 
