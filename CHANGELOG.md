@@ -25,14 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pause caused by end-of-file (`eof-reached`, including `keep-open`) or idle
   is not faded. The fade path was unpausing a finished file and playing the
   tail again. Space / `p` at that point toggle pause directly.
-- Script-owned pause writes are ignored with a counter. Returning from
-  `observe_property` does not cancel the change. A pause that arrives during
-  a fade-in reverses into a fade-out instead of being dropped.
+- Script pause writes are matched to the value mpv delivers, not counted.
+  Opposite writes that coalesce (zero-length fades, keep-open putting pause
+  back) no longer leave a stuck counter that ignores later pauses. The match
+  state resets when a file loads and on cleanup.
+- External pause no longer unpauses for the fade. OSC, MPRIS, and `cycle pause`
+  stay stopped. Keyboard pause still fades out while audio is playing.
+- Audible volume stays at 0 for that whole pause, so an external unpause
+  starts silent and then fades in. The saved level comes back when the fade-in
+  finishes, and on file end or shutdown.
+- Blur uses `sharpen` only on legacy `vo=gpu` when the property exists.
+  `gpu-next` is dim only.
 
 ### Added
 - Short picture ease on the same ramp as the audio (`video_transition`, default
-  `soft`): a mid-fade dim, plus a blur on `gpu` and `gpu-next`. The paused
-  frame is sharp again unless `video_hold=yes`.
+  `soft`): a mid-fade dim, plus a blur on legacy `vo=gpu` when `sharpen`
+  exists. The paused frame is sharp again unless `video_hold=yes`.
 - `fade_curve=logarithmic` for an eased decibel ramp. `fade_curve=linear` keeps
   a straight ramp. `logarithmic_fade=no` still selects linear when
   `fade_curve=auto`.

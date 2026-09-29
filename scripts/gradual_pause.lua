@@ -5,11 +5,15 @@
 --
 -- mpv's volume property is cubic in gain (gain = (volume/100)^3). The default
 -- ramp moves loudness evenly in decibels and only eases the corners, so the
--- fade is audible the whole way and does not click. Playback keeps running
--- through the fade-out and resumes from the frame where it actually paused.
--- Seeking back to the pre-fade timestamp restarted the decoder, cut the
--- picture, and threw away seeks made while paused. restore_position=yes opts
--- into that seek, and still yields if the paused position moved.
+-- fade is audible the whole way and does not click. A keyboard pause keeps
+-- playback running through the fade-out, then pauses. An external pause
+-- (MPRIS, OSC) has already stopped playback; the script does not resume it
+-- for the fade. While that pause holds, audible volume stays 0 so a later
+-- unpause cannot start at full volume. Resume continues from the paused
+-- frame. Seeking back to the pre-fade timestamp restarted the decoder, cut
+-- the picture, and threw away seeks made while paused.
+-- restore_position=yes opts into that seek, and still yields if the paused
+-- position moved.
 
 local mp = require 'mp'
 local options = require 'mp.options'
@@ -25,7 +29,7 @@ local opts = {
     logarithmic_fade = true,   -- legacy: auto+yes → smooth, auto+no → linear
     video_transition = "soft", -- none | dim | blur | soft
     video_hold = false,        -- keep the softened look while paused
-    blur_strength = 28,        -- peak negative sharpen (gpu / gpu-next)
+    blur_strength = 28,        -- peak negative sharpen; legacy vo=gpu only
     dim_strength = 22,         -- peak equalizer dip (contrast / saturation / brightness)
     restore_position = false,  -- seek back to the pre-fade time on unpause
     debug_mode = false,
@@ -45,8 +49,13 @@ local phase_target = 0
 local phase_started = 0
 local phase_dur = 0
 local fade_timer = nil
-local pause_writes = 0
+-- One outstanding script pause write, not a count. mpv may coalesce opposite
+-- writes into a single notification, or into none, so a counter leaks.
+local pause_epoch = 0
+local pause_pending = nil -- { epoch, value }
+local pause_ack = nil -- last value already reconciled, same epoch
 local pause_ready = false
+local quiet_hold = false -- audible volume is pinned at 0 while paused
 local active_file = false
 local held_soft = false
 local anchor_pos = nil
@@ -198,14 +207,53 @@ local function no_osd_set(name, value)
     end
 end
 
+local function reset_pause_ack()
+    pause_epoch = pause_epoch + 1
+    pause_pending = nil
+    pause_ack = nil
+end
+
 local function set_pause(value)
     if mp.get_property_bool("pause") == value then
+        -- Already there. An earlier opposite write in this turn will not be
+        -- delivered if the net value matches the last notification.
+        pause_pending = nil
         return
     end
-    -- observe_property cannot cancel the change, and its return value is
-    -- ignored. Count our own writes so the observer does not start a second fade.
-    pause_writes = pause_writes + 1
+    local epoch = pause_epoch
+    pause_pending = { epoch = epoch, value = value }
     mp.set_property_bool("pause", value)
+    -- If the notification is coalesced away, drop the pending ack once the
+    -- property has the value we wrote. A later delivery of that same value is
+    -- still ours (`pause_ack`). A different value is not.
+    mp.add_timeout(0, function()
+        if pause_epoch ~= epoch or not pause_pending then
+            return
+        end
+        if pause_pending.epoch ~= epoch or pause_pending.value ~= value then
+            return
+        end
+        if mp.get_property_bool("pause") == value then
+            pause_ack = { epoch = epoch, value = value }
+        end
+        pause_pending = nil
+    end)
+end
+
+local function consume_script_pause(value)
+    if pause_pending and pause_pending.epoch == pause_epoch
+        and pause_pending.value == value then
+        pause_ack = { epoch = pause_epoch, value = value }
+        pause_pending = nil
+        return true
+    end
+    if pause_ack and pause_ack.epoch == pause_epoch and pause_ack.value == value then
+        pause_ack = nil
+        return true
+    end
+    pause_pending = nil
+    pause_ack = nil
+    return false
 end
 
 local function stop_timer()
@@ -230,8 +278,12 @@ local function has_video()
 end
 
 local function vo_supports_blur()
-    local vo = mp.get_property("current-vo") or ""
-    return vo == "gpu" or vo == "gpu-next"
+    -- `sharpen` is a legacy vo=gpu control. gpu-next never applied it, and
+    -- current mpv removed the property. Dim still runs on those VOs.
+    if (mp.get_property("current-vo") or "") ~= "gpu" then
+        return false
+    end
+    return mp.get_property_number("sharpen") ~= nil
 end
 
 local function restore_video()
@@ -391,6 +443,20 @@ local function maybe_restore_position()
     paused_pos = nil
 end
 
+-- Pin audible volume at 0 without forgetting the user's level. External
+-- unpause then starts silent, before this script's observer runs.
+local function hold_quiet()
+    if not quiet_hold then
+        local vol = mp.get_property_number("volume")
+        if vol and vol > 0.5 then
+            base_volume = vol
+        end
+    end
+    quiet_hold = true
+    level = 0
+    no_osd_set("volume", 0)
+end
+
 local function finish_fade()
     local direction = phase
     if not direction then
@@ -401,9 +467,7 @@ local function finish_fade()
 
     if direction == "out" then
         level = 0
-        if base_volume then
-            no_osd_set("volume", 0)
-        end
+        hold_quiet()
         if opts.video_hold and video_saved then
             apply_softness(1)
             held_soft = true
@@ -413,14 +477,12 @@ local function finish_fade()
         paused_pos = mp.get_property_number("time-pos")
         debug_log(string.format("Fade-out complete, pausing at %.3f",
             paused_pos or -1))
-        set_pause(true)
-        -- Restore the user's volume while paused so quit/OSD don't stick at 0.
-        -- The fade-in path zeroes it again before playback resumes.
-        if base_volume then
-            no_osd_set("volume", base_volume)
+        if not mp.get_property_bool("pause") then
+            set_pause(true)
         end
     else
         level = 1
+        quiet_hold = false
         if base_volume then
             no_osd_set("volume", base_volume)
         end
@@ -443,7 +505,9 @@ local function on_tick()
     end
     level = multiplier_for(phase_origin, phase_target, t, resolved_curve())
 
-    if base_volume and base_volume > 0 then
+    if quiet_hold then
+        no_osd_set("volume", 0)
+    elseif base_volume and base_volume > 0 then
         no_osd_set("volume", math.max(0, base_volume * level))
     end
     apply_softness(softness_for(level))
@@ -459,63 +523,8 @@ local function on_tick()
     end
 end
 
-local function begin_fade(direction)
-    if not active_file then
-        return
-    end
-    if direction == "out" and phase == nil and is_natural_stop() then
-        debug_log("Ignoring pause caused by end of file or idle")
-        return
-    end
-    if direction == "out" and phase == "out" then
-        if mp.get_property_bool("pause") then
-            set_pause(false)
-        end
-        return
-    end
-    if direction == "in" and phase == "in" then
-        return
-    end
-
-    local settled = phase == nil
-
-    if direction == "out" and settled then
-        capture_volume()
-        anchor_pos = mp.get_property_number("time-pos")
-        if anchor_pos then
-            debug_log(string.format("Fade-out anchor: %.3f", anchor_pos))
-        end
-        if not held_soft then
-            capture_video()
-        end
-        if (base_volume or 0) <= 0 then
-            set_pause(true)
-            return
-        end
-    end
-
-    if direction == "in" and settled then
-        capture_volume()
-        if not held_soft then
-            capture_video()
-        end
-        -- Zero before unpause so a decoder/AO restart has nothing to click with.
-        level = 0
-        if base_volume and base_volume > 0 then
-            no_osd_set("volume", 0)
-        end
-        maybe_restore_position()
-    end
-
-    if mp.get_property_bool("pause") then
-        set_pause(false)
-    end
-
-    local target = direction == "out" and 0 or 1
-    local origin = level
-    local full = direction == "out" and opts.fade_out_duration or opts.fade_in_duration
+local function arm_timer(direction, origin, target, full)
     local span = math.abs(target - origin)
-
     phase = direction
     phase_origin = origin
     phase_target = target
@@ -537,6 +546,104 @@ local function begin_fade(direction)
 
     stop_timer()
     fade_timer = mp.add_periodic_timer(interval_for(phase_dur), on_tick)
+end
+
+local function begin_fade(direction)
+    if not active_file then
+        return
+    end
+
+    -- End of file already stopped playback. Do not unpause it to fade.
+    if direction == "out" and is_natural_stop() then
+        debug_log("Ignoring pause caused by end of file or idle")
+        stop_timer()
+        phase = nil
+        restore_video()
+        if quiet_hold then
+            quiet_hold = false
+            if base_volume then
+                no_osd_set("volume", base_volume)
+            end
+        end
+        return
+    end
+
+    -- External pause (or any pause that is already in effect). Resuming here
+    -- would play past the pause request for the whole fade.
+    if direction == "out" and mp.get_property_bool("pause") then
+        stop_timer()
+        phase = nil
+        if anchor_pos == nil then
+            anchor_pos = mp.get_property_number("time-pos")
+        end
+        hold_quiet()
+        if not held_soft then
+            capture_video()
+        end
+        paused_pos = mp.get_property_number("time-pos")
+        if video_saved and opts.fade_out_duration > 0 then
+            debug_log("Picture ease while paused; audio stays stopped")
+            arm_timer("out", 1, 0, opts.fade_out_duration)
+        else
+            if opts.video_hold and video_saved then
+                apply_softness(1)
+                held_soft = true
+            else
+                restore_video()
+            end
+        end
+        return
+    end
+
+    if direction == "out" and phase == "out" then
+        return
+    end
+    if direction == "in" and phase == "in" then
+        return
+    end
+
+    -- Reversing a keyboard fade-out that is still playing: keep the current
+    -- level. Every other fade-in starts from silence.
+    local reversing = direction == "in" and phase == "out" and not quiet_hold
+
+    if direction == "out" and phase == nil then
+        capture_volume()
+        anchor_pos = mp.get_property_number("time-pos")
+        if anchor_pos then
+            debug_log(string.format("Fade-out anchor: %.3f", anchor_pos))
+        end
+        if not held_soft then
+            capture_video()
+        end
+        if (base_volume or 0) <= 0 then
+            hold_quiet()
+            set_pause(true)
+            return
+        end
+    end
+
+    if direction == "in" and not reversing then
+        if not quiet_hold then
+            capture_volume()
+        end
+        if not video_saved and not held_soft then
+            capture_video()
+        end
+        level = 0
+        if base_volume and base_volume > 0 then
+            no_osd_set("volume", 0)
+        end
+        maybe_restore_position()
+        quiet_hold = false
+    end
+
+    if direction == "in" and mp.get_property_bool("pause") then
+        set_pause(false)
+    end
+
+    local target = direction == "out" and 0 or 1
+    local full = direction == "out" and opts.fade_out_duration or opts.fade_in_duration
+    arm_timer(direction, level, target, full)
 end
 
 local function handle_pause_key()
@@ -569,11 +676,15 @@ local function on_pause_change(_, value)
     if not pause_ready then
         pause_ready = true
         debug_log("Ignoring initial pause observation (" .. tostring(value) .. ")")
+        -- Already paused when the script loads (for example `--pause`).
+        -- Hold silence so a later external unpause does not start at full volume.
+        if value == true and active_file and not is_natural_stop() then
+            hold_quiet()
+        end
         return
     end
 
-    if pause_writes > 0 then
-        pause_writes = pause_writes - 1
+    if consume_script_pause(value) then
         debug_log("Ignoring script pause write (" .. tostring(value) .. ")")
         return
     end
@@ -591,11 +702,22 @@ local function on_pause_change(_, value)
     end
 end
 
+local function on_volume_change(_, value)
+    if not quiet_hold or value == nil or value <= 0.5 then
+        return
+    end
+    -- The user moved the volume knob while we were holding silence.
+    base_volume = value
+    no_osd_set("volume", 0)
+    debug_log(string.format("Volume adjusted while paused, target %.2f", value))
+end
+
 local function cleanup()
     debug_log("Cleanup")
     stop_timer()
     phase = nil
     restore_video()
+    quiet_hold = false
     if base_volume ~= nil then
         no_osd_set("volume", base_volume)
     end
@@ -604,12 +726,17 @@ local function cleanup()
     anchor_pos = nil
     paused_pos = nil
     active_file = false
+    reset_pause_ack()
 end
 
 local function on_file_loaded()
+    reset_pause_ack()
     active_file = true
-    level = 1
-    held_soft = false
+    if phase == nil then
+        level = 1
+        held_soft = false
+        quiet_hold = false
+    end
     debug_log("File loaded")
 end
 
@@ -618,13 +745,14 @@ validate_options()
 mp.add_forced_key_binding("space", "gradual_pause_space", handle_pause_key)
 mp.add_forced_key_binding("p", "gradual_pause_p", handle_pause_key)
 
-mp.observe_property("pause", "bool", on_pause_change)
-mp.register_event("end-file", cleanup)
-mp.register_event("shutdown", cleanup)
-mp.register_event("file-loaded", on_file_loaded)
-
 if mp.get_property("path") then
     active_file = true
 end
+
+mp.observe_property("pause", "bool", on_pause_change)
+mp.observe_property("volume", "number", on_volume_change)
+mp.register_event("end-file", cleanup)
+mp.register_event("shutdown", cleanup)
+mp.register_event("file-loaded", on_file_loaded)
 
 debug_log("gradual_pause v" .. SCRIPT_VERSION .. " loaded")

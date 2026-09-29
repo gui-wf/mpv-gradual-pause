@@ -44,6 +44,15 @@ local function load_script(overrides)
     local warnings = {}
     local now = 0
     local timer = nil
+    local delivery = "sync"
+    if overrides and overrides.__delivery then
+        delivery = overrides.__delivery
+        overrides.__delivery = nil
+    end
+    local last_notified_pause = props.pause
+    local pause_note = nil
+    local pause_note_valid = false
+    local timeouts = {}
 
     local function fire(name, value)
         for _, ob in ipairs(observers) do
@@ -93,12 +102,82 @@ local function load_script(overrides)
         return now
     end
 
+    local function run_timeouts()
+        local guard = 0
+        while guard < 30 do
+            guard = guard + 1
+            local ran = false
+            local i = 1
+            while i <= #timeouts do
+                if timeouts[i].t <= now + 1e-9 then
+                    local fn = timeouts[i].fn
+                    table.remove(timeouts, i)
+                    fn()
+                    ran = true
+                else
+                    i = i + 1
+                end
+            end
+            if not ran then
+                break
+            end
+        end
+    end
+
+    local function deliver_pause()
+        if not pause_note_valid then
+            return
+        end
+        local note = pause_note
+        pause_note_valid = false
+        if note == last_notified_pause then
+            return
+        end
+        last_notified_pause = note
+        fire("pause", note)
+    end
+
     function mp.set_property_bool(name, value)
-        local changed = props[name] ~= value
+        if name == "pause" and props._repause and value == false then
+            -- keep-open (or similar) puts pause back before mpv notifies.
+            props.pause = true
+            if delivery == "async" then
+                if last_notified_pause == true then
+                    pause_note_valid = false
+                else
+                    pause_note = true
+                    pause_note_valid = true
+                end
+            end
+            return
+        end
         props[name] = value
-        if changed and name == "pause" then
+        if name ~= "pause" then
+            return
+        end
+        if delivery == "async" then
+            if value == last_notified_pause then
+                pause_note_valid = false
+            else
+                pause_note = value
+                pause_note_valid = true
+            end
+            return
+        end
+        if value ~= last_notified_pause then
+            last_notified_pause = value
             fire("pause", value)
         end
+    end
+
+    function mp.add_timeout(seconds, fn)
+        local handle = { t = now + seconds, fn = fn, alive = true }
+        timeouts[#timeouts + 1] = handle
+        function handle:kill()
+            self.alive = false
+            self.fn = function() end
+        end
+        return handle
     end
 
     function mp.set_property_number(name, value)
@@ -160,12 +239,35 @@ local function load_script(overrides)
             if timer and timer.alive then
                 timer.fn()
             end
+            run_timeouts()
         end
     end
 
+    -- Returns the volume audible at the moment pause changes, before the
+    -- script observer runs when delivery is async.
     local function user_pause(value)
+        local audible = props.volume
         props.pause = value and true or false
-        fire("pause", props.pause)
+        if delivery == "async" then
+            if props.pause == last_notified_pause then
+                pause_note_valid = false
+            else
+                pause_note = props.pause
+                pause_note_valid = true
+            end
+        else
+            if props.pause ~= last_notified_pause then
+                last_notified_pause = props.pause
+                fire("pause", props.pause)
+            end
+            run_timeouts()
+        end
+        return audible
+    end
+
+    local function flush()
+        deliver_pause()
+        run_timeouts()
     end
 
     package.loaded["mp"] = mp
@@ -201,6 +303,7 @@ local function load_script(overrides)
         warnings = warnings,
         advance = advance,
         user_pause = user_pause,
+        flush = flush,
         timer = function()
             return timer
         end,
@@ -243,7 +346,7 @@ local function test_fade_out_is_gentle_and_monotonic()
     check("fade-out steps stay fine", max_step < 8, tostring(max_step))
     check("fade-out volume is monotonic", monotonic)
     check("fade-out ends paused", rt.props.pause == true)
-    check("paused volume is restored", near(rt.props.volume, 80, 0.05), tostring(rt.props.volume))
+    check("paused volume stays silent", near(rt.props.volume, 0, 0.05), tostring(rt.props.volume))
     check("settled pause is a clear frame", near(rt.props.contrast, 0, 0.05)
         and near(rt.props.sharpen, 0, 0.05))
 end
@@ -354,10 +457,13 @@ local function test_reverse_and_external_pause()
     rt.advance(0.6)
     rt.keys.space()
     rt.advance(0.12)
+    local pos = rt.props["time-pos"]
     rt.user_pause(true)
     rt.advance(0.6)
     check("external pause during fade-in ends paused", rt.props.pause == true)
-    check("external pause during fade-in restores volume", near(rt.props.volume, 80, 0.05),
+    check("external pause does not keep playing", near(rt.props["time-pos"], pos, 0.02),
+        tostring(rt.props["time-pos"]))
+    check("external pause holds silence", near(rt.props.volume, 0, 0.05),
         tostring(rt.props.volume))
 end
 
@@ -367,11 +473,19 @@ local function test_second_cycle_not_swallowed()
     rt.advance(0.6)
     rt.keys.space()
     rt.advance(0.6)
+    local pos = rt.props["time-pos"]
     rt.user_pause(true)
     rt.advance(0.6)
     check("later external pause is not swallowed", rt.props.pause == true)
-    check("later external pause faded", near(rt.props.volume, 80, 0.05)
-        and (rt.props["time-pos"] > 10.3), tostring(rt.props["time-pos"]))
+    check("later external pause does not play through",
+        near(rt.props["time-pos"], pos, 0.02) and near(rt.props.volume, 0, 0.05),
+        string.format("pos=%s vol=%s", tostring(rt.props["time-pos"]), tostring(rt.props.volume)))
+    local heard = rt.user_pause(false)
+    check("later unpause was already silent", heard ~= nil and heard < 1, tostring(heard))
+    rt.advance(0.08)
+    check("later unpause fades instead of snapping open",
+        rt.props.pause == false and rt.props.volume > 1 and rt.props.volume < 50,
+        tostring(rt.props.volume))
 end
 
 local function test_cleanup_restores_picture()
@@ -425,6 +539,68 @@ local function test_blur_fallback()
         tostring(rt.props.sharpen))
 end
 
+local function test_gpu_next_does_not_blur()
+    local rt = load_script()
+    rt.props["current-vo"] = "gpu-next"
+    rt.props.sharpen = 0
+    rt.keys.space()
+    rt.advance(0.22)
+    check("gpu-next does not write sharpen", near(rt.props.sharpen, 0, 0.05),
+        tostring(rt.props.sharpen))
+    check("gpu-next still dims", rt.props.contrast < -4, tostring(rt.props.contrast))
+end
+
+local function test_async_external_unpause_is_silent()
+    local rt = load_script({ __delivery = "async", fade_out_duration = 0 })
+    local pos = rt.props["time-pos"]
+    rt.user_pause(true)
+    rt.flush()
+    check("zero-duration external pause stays paused", rt.props.pause == true)
+    check("zero-duration external pause is silent", near(rt.props.volume, 0, 0.05),
+        tostring(rt.props.volume))
+    rt.advance(0.35)
+    check("zero-duration external pause does not play through",
+        near(rt.props["time-pos"], pos, 0.001), tostring(rt.props["time-pos"]))
+
+    local heard = rt.user_pause(false)
+    check("async unpause hears silence before the observer", heard < 1, tostring(heard))
+    rt.flush()
+    check("first fade-in sample is not full volume", rt.props.volume < 5,
+        tostring(rt.props.volume))
+    rt.advance(0.08)
+    check("async unpause then ramps", rt.props.volume > 1 and rt.props.volume < 55,
+        tostring(rt.props.volume))
+
+    local pos2 = rt.props["time-pos"]
+    rt.user_pause(true)
+    rt.flush()
+    rt.advance(0.3)
+    check("second external pause is not swallowed",
+        rt.props.pause == true and near(rt.props["time-pos"], pos2, 0.02),
+        string.format("pause=%s pos=%s", tostring(rt.props.pause),
+            tostring(rt.props["time-pos"])))
+end
+
+local function test_coalesced_eof_toggle_does_not_stick()
+    local rt = load_script({ __delivery = "async" })
+    rt.props["eof-reached"] = true
+    rt.user_pause(true)
+    rt.flush()
+    rt.props._repause = true
+    rt.keys.space()
+    rt.flush()
+    check("coalesced eof toggle stays paused", rt.props.pause == true)
+    rt.props["eof-reached"] = false
+    rt.props._repause = false
+    rt.user_pause(false)
+    rt.flush()
+    rt.advance(0.08)
+    check("pause ack does not swallow the next unpause",
+        rt.props.pause == false and rt.props.volume < 55,
+        string.format("pause=%s vol=%s", tostring(rt.props.pause),
+            tostring(rt.props.volume)))
+end
+
 test_startup_does_not_duck()
 test_fade_out_is_gentle_and_monotonic()
 test_coarse_steps_still_sample_finely()
@@ -439,6 +615,9 @@ test_second_cycle_not_swallowed()
 test_cleanup_restores_picture()
 test_curves_and_validation()
 test_blur_fallback()
+test_gpu_next_does_not_blur()
+test_async_external_unpause_is_silent()
+test_coalesced_eof_toggle_does_not_stick()
 
 if fails > 0 then
     io.write(fails, " failed\n")

@@ -95,43 +95,23 @@ local function run_main()
             issue_pos = mp.get_property_number("time-pos")
             mp.set_property_bool("pause", true)
 
-            wait_until(2.0, function()
-                return mp.get_property_bool("pause")
-                    and (mp.get_property_number("volume") or 0) > 75
+            local held_since = mp.get_time()
+            wait_until(1.5, function()
+                return mp.get_time() - held_since > 0.55
+                    and mp.get_property_bool("pause")
+                    and (mp.get_property_number("volume") or 1) < 1
             end, function(ok)
-                local max_drop = 0
-                local prev_vol = nil
-                local moved = false
-                for _, s in ipairs(samples) do
-                    if s.t >= issue_t and s.t <= issue_t + 0.20 and s.vol and not s.pause then
-                        if prev_vol and s.vol < prev_vol - 0.05 then
-                            local drop = prev_vol - s.vol
-                            if drop > max_drop then
-                                max_drop = drop
-                            end
-                            moved = true
-                        end
-                        if s.vol then
-                            prev_vol = s.vol
-                        end
-                    end
-                end
-                if moved and max_drop < 8 then
-                    report("PASS", "fade-out-starts-gently",
-                        string.format("max step=%.2f", max_drop))
-                else
-                    report("FAIL", "fade-out-starts-gently",
-                        string.format("moved=%s max step=%s", tostring(moved), tostring(max_drop)))
-                end
-
                 local paused_pos = mp.get_property_number("time-pos")
-                if ok and issue_pos and paused_pos and paused_pos >= issue_pos - 0.08 then
-                    report("PASS", "pause-does-not-rewind",
-                        string.format("%.3f -> %.3f", issue_pos, paused_pos))
+                local vol_now = mp.get_property_number("volume") or -1
+                if ok and issue_pos and paused_pos
+                    and math.abs(paused_pos - issue_pos) < 0.08
+                    and vol_now < 1 then
+                    report("PASS", "external-pause-stays-stopped",
+                        string.format("pos %.3f vol %.2f", paused_pos, vol_now))
                 else
-                    report("FAIL", "pause-does-not-rewind",
-                        string.format("%s -> %s ok=%s", tostring(issue_pos),
-                            tostring(paused_pos), tostring(ok)))
+                    report("FAIL", "external-pause-stays-stopped",
+                        string.format("ok=%s %s -> %s vol=%s", tostring(ok),
+                            tostring(issue_pos), tostring(paused_pos), tostring(vol_now)))
                 end
 
                 local dipped = false
@@ -158,6 +138,7 @@ local function run_main()
                     return pos and math.abs(pos - target) < 0.35
                 end, function(seeked)
                     local pos_before = mp.get_property_number("time-pos")
+                    local vol_before = mp.get_property_number("volume") or 100
                     mp.set_property_bool("pause", false)
                     mp.add_timeout(0.12, function()
                         local pos = mp.get_property_number("time-pos")
@@ -165,14 +146,16 @@ local function run_main()
                         if seeked and pos and pos_before
                             and math.abs(pos - pos_before) < 0.5
                             and pos > (issue_pos or 0) + 1.5
+                            and vol_before < 1
                             and vol > 3 and vol < 45 then
                             report("PASS", "seek-survives-unpause",
-                                string.format("pos=%.3f vol=%.2f", pos, vol))
+                                string.format("pos=%.3f vol=%.2f held=%.2f",
+                                    pos, vol, vol_before))
                         else
                             report("FAIL", "seek-survives-unpause",
-                                string.format("seeked=%s before=%s pos=%s vol=%s",
+                                string.format("seeked=%s before=%s pos=%s vol=%s held=%s",
                                     tostring(seeked), tostring(pos_before),
-                                    tostring(pos), tostring(vol)))
+                                    tostring(pos), tostring(vol), tostring(vol_before)))
                         end
                         finish()
                     end)
@@ -211,10 +194,11 @@ local function run_restore()
     mp.register_event("file-loaded", function()
         mp.add_timeout(0.45, function()
             local anchor = mp.get_property_number("time-pos")
-            mp.set_property_bool("pause", true)
+            -- Keyboard fade-out is what moves playback; external pause does not.
+            mp.commandv("keypress", "space")
             wait_until(2.0, function()
                 return mp.get_property_bool("pause")
-                    and (mp.get_property_number("volume") or 0) > 75
+                    and (mp.get_property_number("volume") or 1) < 1
             end, function(ok)
                 local paused_at = mp.get_property_number("time-pos")
                 mp.set_property_bool("pause", false)
