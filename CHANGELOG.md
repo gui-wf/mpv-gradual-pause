@@ -7,10 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Unpause no longer seeks back to the pre-fade timestamp. That seek restarted
+  the audio decoder, cut the picture to an earlier frame, and discarded seeks
+  made while paused. Resume continues from the frame where the fade settled.
+  `restore_position=yes` opts into the old seek and still leaves a paused seek
+  alone (more than 0.25s from where playback paused).
+- The default ramp is even in loudness (decibels), with eased corners. The
+  previous "logarithmic" parabola was steepest on the first step (a measured
+  fade-out jumped 80 → 67 in one tick, about 4.6 dB). A pure ease on the
+  volume slider was the other failure mode: mpv's cubic gain map hid that
+  curve in silence, then the sound swelled late in the unpause.
+- Volume updates are at most 20ms apart, so a low `steps` value cannot zipper.
+  Updates use `no-osd set`, so the volume bar does not flash on every step.
+- The initial `pause` property notification is ignored. It used to be handled
+  as an unpause and ducked the start of every file to silence.
+- Pause caused by end-of-file (`eof-reached`, including `keep-open`) or idle
+  is not faded. The fade path was unpausing a finished file and playing the
+  tail again. Space / `p` at that point toggle pause directly.
+- Script pause writes are matched to the value mpv delivers, not counted.
+  Opposite writes that coalesce (zero-length fades, keep-open putting pause
+  back) no longer leave a stuck counter that ignores later pauses. The match
+  state resets when a file loads and on cleanup.
+- External pause no longer unpauses for the fade. OSC, MPRIS, and `cycle pause`
+  stay stopped. Keyboard pause still fades out while audio is playing.
+- Audible volume stays at 0 for that whole pause, so an external unpause
+  starts silent and then fades in. The saved level comes back when the fade-in
+  finishes, and on file end or shutdown.
+- Blur uses `sharpen` only on legacy `vo=gpu` when the property exists.
+  `gpu-next` is dim only.
+
+### Added
+- Short picture ease on the same ramp as the audio (`video_transition`, default
+  `soft`): a mid-fade dim, plus a blur on legacy `vo=gpu` when `sharpen`
+  exists. The paused frame is sharp again unless `video_hold=yes`.
+- `fade_curve=logarithmic` for an eased decibel ramp. `fade_curve=linear` keeps
+  a straight ramp. `logarithmic_fade=no` still selects linear when
+  `fade_curve=auto`.
+- Unit tests (`lua5.4 tests/run_unit.lua`) and headless mpv checks
+  (`tests/run_integration.sh`).
+
+### Changed
+- Default `fade_in_duration` is 0.45s, matching fade-out, so unpause is not a
+  shorter, steeper ramp.
+
 ### Planned
-- Exponential and sine-wave fade curve options
 - Per-file configuration support
-- Integration tests
 - AUR package
 - Homebrew formula
 

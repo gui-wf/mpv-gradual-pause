@@ -1,26 +1,28 @@
 # MPV Gradual Pause
 
-MPV script that adds smooth audio fade effects when pausing/unpausing
+MPV script that eases pause and unpause instead of cutting them off.
 
 Do the immediate audio cut on pausing media bugs you?
 Frustrate no more -> I fade the audio on your music and video experience.
 
 I'm an MPV Script that adds a fade-in and fade-out effect
-when pausing or unpausing music/video playback.
+when pausing or unpausing music/video playback, plus a short picture ease
+so the freeze is not a hard cut.
 
-Features logarithmic and linear volume curves, MPRIS "integration"
-support, and robust state management for seamless operation with external
-pause controls.
+Features an ease-in-out volume curve (with linear and decibel options),
+a brief dim/blur on video, MPRIS support, and an end-of-file guard so
+`keep-open` does not flicker.
 
 ## Features
 
-- **Smooth Audio Transitions**: Configurable fade-in/fade-out effects eliminate abrupt audio cuts
-- **Logarithmic & Linear Curves**: Choose between natural-sounding logarithmic fading or constant-rate linear fading
-- **MPRIS Integration**: Works seamlessly with external pause/unpause triggers (media keys, system controls, remote apps)
+- **Smooth Audio Transitions**: Fade-out and fade-in with a flat start and end, so the ramp does not click
+- **Curves**: Default ease-in-out, plus linear and decibel ramps
+- **Soft Picture**: A short dim across the same moment, plus a blur on the legacy `gpu` VO when `sharpen` exists. The still frame is clear again
+- **MPRIS Integration**: External pause stays paused (it does not keep playing through the fade). Unpause fades in from silence, including from the OSC and MPRIS
+- **End-of-file guard**: A pause from `keep-open` / `eof-reached` is left alone
+- **Seeks while paused stick**: Unpause continues from the paused frame, or from wherever you seeked
 - **Zero Performance Impact**: Lightweight Lua implementation with negligible CPU usage
-- **Highly Configurable**: Fine-tune fade durations, step counts, and curve types
 - **Debug Mode**: Built-in logging for troubleshooting
-- **Position Preservation**: Maintains exact playback position through pause cycles
 
 ## The Problem
 
@@ -34,8 +36,9 @@ By default, MPV (and most media players) instantly cuts audio when you pause, cr
 
 **gradual-pause** intercepts pause/unpause events and applies smooth volume fading:
 
-- **Fade-out**: Gradually reduces volume to 0 before pausing (default: 0.45s)
-- **Fade-in**: Gradually increases volume from 0 after unpausing (default: 0.3s)
+- **Fade-out**: Eases volume to 0 while playback continues, then pauses (default: 0.45s)
+- **Fade-in**: Eases volume back up from silence (default: 0.45s)
+- **Picture**: Softens during that same ramp, then rests on a sharp frame
 - **Smart handling**: Works with keyboard shortcuts, media keys, and external controls
 
 ## Installation
@@ -124,10 +127,16 @@ nano ~/.config/mpv/script-opts/gradual_pause.conf
 | Option | Type | Default | Range | Description |
 |--------|------|---------|-------|-------------|
 | `fade_out_duration` | float | `0.45` | 0.0 - 5.0 | Fade-out duration in seconds when pausing |
-| `fade_in_duration` | float | `0.3` | 0.0 - 5.0 | Fade-in duration in seconds when unpausing |
-| `steps` | integer | `12` | 1 - 100 | Number of volume steps (higher = smoother) |
-| `logarithmic_fade` | boolean | `yes` | yes/no | Use logarithmic curve (more natural) vs linear |
-| `debug_mode` | boolean | `no` | yes/no | Enable debug logging to MPV console |
+| `fade_in_duration` | float | `0.45` | 0.0 - 5.0 | Fade-in duration in seconds when unpausing |
+| `steps` | integer | `12` | 1 - 100 | Legacy rate hint. The ramp is never coarser than 20ms |
+| `fade_curve` | string | `auto` | auto, smooth, linear, logarithmic | Ramp shape. `auto` follows `logarithmic_fade` |
+| `logarithmic_fade` | boolean | `yes` | yes/no | With `fade_curve=auto`: yes = smooth ease, no = linear |
+| `video_transition` | string | `soft` | soft, dim, blur, none | Picture ease. `none` is audio only |
+| `video_hold` | boolean | `no` | yes/no | Keep the softened picture for the whole pause |
+| `blur_strength` | float | `28` | 0 - 100 | Peak blur on legacy `vo=gpu` only, via `sharpen` |
+| `dim_strength` | float | `22` | 0 - 100 | Peak contrast / saturation / brightness dip |
+| `restore_position` | boolean | `no` | yes/no | Seek back to the pre-fade time on unpause |
+| `debug_mode` | boolean | `no` | yes/no | Enable debug logging to the mpv console |
 
 ### Configuration Examples
 
@@ -137,16 +146,30 @@ fade_out_duration=0.2
 fade_in_duration=0.15
 ```
 
-#### Ultra-Smooth Fades (More Steps)
+#### Longer, slower fades
 ```ini
-steps=24
-fade_out_duration=0.6
-fade_in_duration=0.4
+fade_out_duration=0.7
+fade_in_duration=0.7
 ```
 
-#### Linear Fading (Constant Rate)
+#### Linear ramp (constant rate on the volume property)
 ```ini
-logarithmic_fade=no
+fade_curve=linear
+```
+
+#### Decibel ramp
+```ini
+fade_curve=logarithmic
+```
+
+#### Audio only
+```ini
+video_transition=none
+```
+
+#### Keep the paused frame soft
+```ini
+video_hold=yes
 ```
 
 #### Debug Mode (Troubleshooting)
@@ -170,32 +193,47 @@ Once installed, the script works transparently:
 
 1. **Press `Space` or `p`** to pause → audio fades out smoothly
 2. **Press `Space` or `p` again** to unpause → audio fades in smoothly
-3. **Use media keys** (play/pause) → same smooth behavior
-4. **External controls** (smartphone remotes, MPRIS) → same smooth behavior
+3. **Pause from the OSC, a media key, or MPRIS** → playback stops immediately and stays stopped. Audible volume is held at 0, so unpause fades in instead of blasting full volume. The picture can still ease while the frame is frozen.
+4. **Unpause from those same controls** → audio rises from silence. It does not start at full volume and then drop.
 
-The script intercepts pause events from **any source** and applies fading automatically.
+Keyboard pause is the one that fades audio out while the file is still playing, because the script sees the key before mpv pauses. An external pause has already paused by the time the script runs, and the script does not unpause it to manufacture a fade.
 
 ## How It Works
 
 ### Technical Overview
 
-1. **Key Binding Override**: Intercepts `space` and `p` keys using `add_forced_key_binding`
-2. **Property Observation**: Monitors the `pause` property for external changes (MPRIS, media keys)
-3. **Volume Manipulation**: Uses periodic timers to step volume in calculated increments
-4. **State Management**: Prevents conflicts when multiple pause events occur simultaneously
-5. **Position Preservation**: Saves and restores exact playback position to maintain continuity
+1. **Key binding override**: `space` and `p` go through the script (`add_forced_key_binding`)
+2. **Property observation**: the `pause` property covers MPRIS, the OSC, and media keys
+3. **Volume ramp**: a timer samples a continuous curve at least every 20ms, without the OSD bar
+4. **No backward seek**: a keyboard fade-out keeps playing, then pauses on the later frame. Unpause continues from that frame, so a seek made while paused is still there. An external pause does not resume playback
+5. **Picture ease**: contrast, saturation, and brightness dip during the ramp. Blur is only the legacy `gpu` VO's `sharpen` property, and only when that property exists. `gpu-next` and current mpv builds without `sharpen` get the dim alone. With `video_hold=no` the effect peaks mid-fade and the still frame is sharp
+6. **End of file**: a pause that arrives with `eof-reached` (or while idle) is not treated as a user pause
+7. **Silent hold**: after a script pause, the volume property stays 0 until fade-in. That is what keeps an OSC/MPRIS unpause from starting at full volume. The saved level is restored when the fade-in finishes, and again on file end or shutdown
 
-### Logarithmic vs Linear Fading
+`observe_property` cannot cancel a pause, and its return value is ignored. Script pause writes are matched against the delivered value (and cleared if mpv coalesces them), including across file loads.
 
-**Logarithmic Fade** (default):
-- Starts fast, ends slow (fade-out) / Starts slow, ends fast (fade-in)
-- Perceived as more "natural" to human hearing
-- Mimics professional audio engineering techniques
+### Curves
 
-**Linear Fade**:
-- Constant volume change rate
-- Simpler, more predictable behavior
-- Slightly more "mechanical" feel
+mpv turns the `volume` property into gain with a cube (`gain = (volume/100)^3`).
+
+**Smooth** (default): loudness moves roughly evenly in decibels, from full volume down to about -36 dB (and back). The first and last moments are eased so the ramp does not corner. This is the curve that stays gradual on unpause.
+
+**Linear**: constant slope on the volume property. Set `fade_curve=linear` or `logarithmic_fade=no`.
+
+**Logarithmic**: the same kind of decibel ramp, with a deeper floor (about -48 dB). Set `fade_curve=logarithmic`.
+
+### Picture transition
+
+| `video_transition` | What you get |
+| --- | --- |
+| `soft` (default) | Dim on any VO that exposes the equalizer. On legacy `vo=gpu`, also a `sharpen` blur when that property exists |
+| `dim` | Equalizer only |
+| `blur` | `sharpen` blur on legacy `vo=gpu`; every other VO, including `gpu-next`, falls back to dim |
+| `none` | Audio only |
+
+`blur_strength` and `dim_strength` scale the peak. The blur is not a libavfilter graph. `gpu-next` does not honor `sharpen`, and newer mpv removed the property, so those setups stay on the dim.
+
+`restore_position=yes` seeks back to where fade-out began, which is the old behavior and does cut the picture. A seek that moved `time-pos` more than 0.25s while paused is kept either way.
 
 ### Performance Impact
 
@@ -212,7 +250,7 @@ The script intercepts pause events from **any source** and applies fading automa
 mpv --msg-level=all=debug video.mp4 2>&1 | grep gradual
 ```
 
-You should see: `[gradual_pause] gradual_pause v1.0.0 loaded successfully`
+You should see: `gradual_pause v1.1.0 loaded` when `debug_mode=yes`
 
 **Common issues**:
 - Ensure script is in `~/.config/mpv/scripts/` (not `~/.mpv/scripts/`)
@@ -328,12 +366,25 @@ nix-build -E 'with import <nixpkgs> {}; callPackage ./nix/package.nix {}'
 ### Running Tests
 
 ```bash
-# Test with different fade durations
-for duration in 0.1 0.3 0.5 1.0; do
-  echo "Testing fade duration: $duration"
-  mpv --script-opts=gradual_pause-fade_out_duration=$duration,gradual_pause-debug_mode=yes video.mp4
-done
+# Curve, seek, eof, and picture-ease behavior without a display
+lua5.4 tests/run_unit.lua
+
+# Same checks inside mpv (needs mpv and ffmpeg on PATH)
+sh tests/run_integration.sh
+
+# Listen to it
+mpv --script=./scripts/gradual_pause.lua \
+    --script-opts=gradual_pause-debug_mode=yes \
+    video.mp4
 ```
+
+Manual pass:
+
+1. Pause with `space`. Audio should ease down with no click on the first moment, and the picture should soften then rest sharp on a later frame (not a jump backward).
+2. Seek while paused, then unpause. Playback continues from the seek, fading in from silence.
+3. Unpause without seeking. Audio eases up from the paused frame; it does not replay the fade-out.
+4. Let a file hit the end with `keep-open=yes`. The player stays paused and does not fade or replay the tail.
+5. Pause from the OSC or MPRIS. Playback should stop at once and stay stopped (no extra half-second of the file). Unpause should fade in from silence, not from full volume.
 
 ## Changelog
 
