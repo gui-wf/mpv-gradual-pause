@@ -51,6 +51,21 @@ Add to your Home Manager configuration:
 programs.mpv = {
   enable = true;
   scripts = [ pkgs.mpvScripts.gradual-pause ];
+
+  # Optional. Current defaults. Leave this out to keep the built-in values.
+  # scriptOpts."gradual_pause" = {
+  #   fade_out_duration = 0.45;
+  #   fade_in_duration = 0.45;
+  #   steps = 12;
+  #   fade_curve = "auto";
+  #   logarithmic_fade = true;
+  #   video_transition = "soft";
+  #   video_hold = false;
+  #   blur_strength = 28;
+  #   dim_strength = 22;
+  #   restore_position = false;
+  #   debug_mode = false;
+  # };
 };
 ```
 
@@ -70,6 +85,37 @@ environment.systemPackages = with pkgs; [
     scripts = [ mpvScripts.gradual-pause ];
   })
 ];
+
+# Optional. Current defaults. Leave this out to keep the built-in values.
+# scriptOpts."gradual_pause" = {
+#   fade_out_duration = 0.45;
+#   fade_in_duration = 0.45;
+#   steps = 12;
+#   fade_curve = "auto";
+#   logarithmic_fade = true;
+#   video_transition = "soft";
+#   video_hold = false;
+#   blur_strength = 28;
+#   dim_strength = 22;
+#   restore_position = false;
+#   debug_mode = false;
+# };
+#
+# That attribute is programs.mpv in Home Manager. On NixOS, write the same
+# set to /etc/mpv/script-opts/gradual_pause.conf (booleans are yes/no):
+# environment.etc."mpv/script-opts/gradual_pause.conf".text = ''
+#   fade_out_duration=0.45
+#   fade_in_duration=0.45
+#   steps=12
+#   fade_curve=auto
+#   logarithmic_fade=yes
+#   video_transition=soft
+#   video_hold=no
+#   blur_strength=28
+#   dim_strength=22
+#   restore_position=no
+#   debug_mode=no
+# '';
 ```
 
 Then rebuild:
